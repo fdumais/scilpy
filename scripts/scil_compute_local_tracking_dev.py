@@ -20,6 +20,21 @@ As in scil_compute_local_tracking:
 
 Contrary to scil_compute_local_tracking:
     - Input nifti files do not necessarily need to be in isotropic resolution.
+    - The script works with asymmetric input ODF.
+    - The interpolation for the tracking mask and spherical function can be
+      one of 'nearest' or 'trilinear'.
+    - Runge-Kutta integration is supported for the step function.
+
+A few notes on Runge-Kutta integration.
+    1. Runge-Kutta integration is used to approximate the next tracking
+       direction by estimating directions from future tracking steps. This
+       works well for deterministic tracking. However, in the context of
+       probabilistic tracking, the next tracking directions cannot be estimated
+       in advance, because they are picked randomly from a distribution. It is
+       therefore recommanded to keep the rk_order to 1 for probabilistic
+       tracking.
+    2. As a rule of thumb, doubling the rk_order will double the computation
+       time in the worst case.
 
 References: [1] Girard, G., Whittingstall K., Deriche, R., and
             Descoteaux, M. (2014). Towards quantitative connectivity analysis:
@@ -43,12 +58,10 @@ from scilpy.io.utils import (add_processes_arg, add_sphere_arg,
                              assert_inputs_exist, assert_outputs_exist,
                              verify_compression_th)
 from scilpy.image.datasets import DataVolume
-from scilpy.tracking.propagator import (ProbabilisticODFPropagator,
-                                        DeterministicODFPropagator)
+from scilpy.tracking.propagator import ODFPropagator
 from scilpy.tracking.seed import SeedGenerator
 from scilpy.tracking.tools import get_theta
 from scilpy.tracking.tracker import Tracker
-from scilpy.tracking.tracking_field import ODFField
 from scilpy.tracking.utils import (add_mandatory_options_tracking,
                                    add_out_options, add_seeding_options,
                                    add_tracking_options,
@@ -72,12 +85,12 @@ def _build_arg_parser():
                          default=0.5, dest='sf_threshold_init',
                          help="Spherical function relative threshold value "
                               "for the \ninitial direction. [%(default)s]")
-    track_g.add_argument('--rk_order', metavar="K", type=int, default=2,
+    track_g.add_argument('--rk_order', metavar="K", type=int, default=1,
                          choices=[1, 2, 4],
                          help="The order of the Runge-Kutta integration used "
-                              "for the \nstep function [%(default)s]. As a "
-                              "rule of thumb, doubling the rk_order \nwill "
-                              "double the computation time in the worst case.")
+                              "for the step function.\n"
+                              "For more information, refer to the note in the"
+                              " script description. [%(default)s]")
     track_g.add_argument('--max_invalid_length', metavar='MAX', type=float,
                          default=1,
                          help="Maximum length without valid direction, in mm. "
@@ -111,9 +124,6 @@ def _build_arg_parser():
 
     m_g = p.add_argument_group('Memory options')
     add_processes_arg(m_g)
-    m_g.add_argument('--set_mmap_to_none', action='store_true',
-                     help="If true, use mmap_mode=None. Else mmap_mode='r+'. "
-                          "\nUsed in np.load(data_file_info). TO BE CLEANED")
 
     add_out_options(p)
     add_verbose_arg(p)
@@ -146,10 +156,6 @@ def main():
     min_nbr_pts = int(args.min_length / args.step_size) + 1
     max_invalid_dirs = int(math.ceil(args.max_invalid_length / args.step_size))
 
-    # r+ is necessary for interpolation function in cython who need read/write
-    # rights
-    mmap_mode = None if args.set_mmap_to_none else 'r+'
-
     logging.debug("Loading seeding mask.")
     seed_img = nib.load(args.in_seed)
     seed_data = seed_img.get_fdata(caching='unchanged', dtype=float)
@@ -179,22 +185,21 @@ def main():
     odf_sh_data = odf_sh_img.get_fdata(caching='unchanged', dtype=float)
     odf_sh_res = odf_sh_img.header.get_zooms()[:3]
     dataset = DataVolume(odf_sh_data, odf_sh_res, args.sh_interp)
-    odf_field = ODFField(dataset, args.sh_basis, args.sf_threshold,
-                         args.sf_threshold_init, theta,
-                         dipy_sphere=args.sphere)
+
+    logging.debug("Instantiating propagator.")
+    propagator = ODFPropagator(
+        dataset, args.step_size, args.rk_order, args.algo, args.sh_basis,
+        args.sf_threshold, args.sf_threshold_init, theta, args.sphere)
 
     logging.debug("Instantiating tracker.")
-    if args.algo == 'det':
-        propagator = DeterministicODFPropagator(odf_field, args.step_size,
-                                                args.rk_order)
-    else:
-        propagator = ProbabilisticODFPropagator(odf_field, args.step_size,
-                                                args.rk_order)
-
     tracker = Tracker(propagator, mask, seed_generator, nbr_seeds, min_nbr_pts,
-                      max_nbr_pts, max_invalid_dirs, args.compress,
-                      args.nbr_processes, args.save_seeds, mmap_mode,
-                      args.rng_seed, args.forward_only, args.skip)
+                      max_nbr_pts, max_invalid_dirs,
+                      compression_th=args.compress,
+                      nbr_processes=args.nbr_processes,
+                      save_seeds=args.save_seeds,
+                      mmap_mode='r+', rng_seed=args.rng_seed,
+                      track_forward_only=args.forward_only,
+                      skip=args.skip)
 
     start = time.time()
     logging.debug("Tracking...")
